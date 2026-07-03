@@ -24,7 +24,6 @@ class ProductCreate(BaseModel):
     images: List[str] = []           # ordered list of image URLs
     image_url: Optional[str] = None  # first image, kept for backwards compat
     active: bool = True
-    category_id: Optional[str] = None
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -33,7 +32,6 @@ class ProductUpdate(BaseModel):
     images: Optional[List[str]] = None
     image_url: Optional[str] = None
     active: Optional[bool] = None
-    category_id: Optional[str] = None
 
 
 # ── Category Schemas ───────────────────────────────────────────────────────────
@@ -135,7 +133,6 @@ def create_product(body: ProductCreate, supabase: Client = Depends(get_supabase)
         "images":      body.images,
         "image_url":   image_url,
         "active":      body.active,
-        "category_id": body.category_id,
     }).execute()
     return {"product": result.data[0]}
 
@@ -196,7 +193,6 @@ def update_category(category_id: str, body: CategoryUpdate, supabase: Client = D
 
 @router.delete("/categories/{category_id}", dependencies=[Depends(verify_admin)])
 def delete_category(category_id: str, supabase: Client = Depends(get_supabase)):
-    supabase.table("products").update({"category_id": None}).eq("category_id", category_id).execute()
     result = supabase.table("categories").delete().eq("id", category_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Category not found")
