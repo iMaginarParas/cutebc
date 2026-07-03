@@ -262,33 +262,31 @@ def public_site_assets():
 
 @app.get("/categories")
 def public_categories():
-    """Return all active categories including their thumbnail image."""
-    result = (
-        supabase.table("categories")
-        .select("id,name,description,slug,image_url")
-        .eq("active", True)
-        .order("name")
-        .execute()
-    )
-    return {"categories": result.data}
+    """Return all active categories. Returns empty list if table does not exist."""
+    try:
+        result = (
+            supabase.table("categories")
+            .select("id,name,description,slug,image_url")
+            .eq("active", True)
+            .order("name")
+            .execute()
+        )
+        return {"categories": result.data}
+    except Exception:
+        return {"categories": []}
 
 
 # ── Products (public) ─────────────────────────────────────────────────────────
 
 @app.get("/products")
-def public_products(category: Optional[str] = Query(None, description="Filter by category slug")):
-    query = (
+def public_products():
+    result = (
         supabase.table("products")
-        .select("id,name,description,price,image_url,images,category_id,created_at")
+        .select("id,name,description,price,image_url,images,created_at")
         .eq("active", True)
         .order("created_at", desc=True)
+        .execute()
     )
-    if category:
-        cat = supabase.table("categories").select("id").eq("slug", category).eq("active", True).execute()
-        if not cat.data:
-            return {"products": []}
-        query = query.eq("category_id", cat.data[0]["id"])
-    result = query.execute()
     return {"products": result.data}
 
 @app.get("/products/{product_id}")
@@ -296,7 +294,7 @@ def public_product_by_id(product_id: str):
     """Fetch a single active product by UUID — used by product.html"""
     result = (
         supabase.table("products")
-        .select("id,name,description,price,image_url,images,category_id,created_at")
+        .select("id,name,description,price,image_url,images,created_at")
         .eq("id", product_id)
         .eq("active", True)
         .execute()
