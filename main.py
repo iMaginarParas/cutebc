@@ -1,4 +1,8 @@
 import os
+import logging
+
+logger = logging.getLogger("upload")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 import httpx
 import uuid
 import mimetypes
@@ -84,45 +88,71 @@ async def upload_image(
 
     After getting the URL, call the relevant endpoint to save it.
     """
+    logger.info(f"[upload] START folder={folder!r} filename={file.filename!r} content_type={file.content_type!r} size_hint={file.size}")
+
+    # ── folder check ──────────────────────────────────────────────────────────
     if folder not in VALID_FOLDERS:
+        logger.warning(f"[upload] REJECTED invalid folder={folder!r}")
         raise HTTPException(
             status_code=400,
             detail=f"Invalid folder '{folder}'. Must be one of: {', '.join(sorted(VALID_FOLDERS))}"
         )
 
+    # ── content-type check ────────────────────────────────────────────────────
     allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}
     content_type = file.content_type or "application/octet-stream"
+    logger.info(f"[upload] content_type resolved to {content_type!r}")
     if content_type not in allowed_types:
+        logger.warning(f"[upload] REJECTED unsupported content_type={content_type!r}")
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}")
 
+    # ── read & size check ─────────────────────────────────────────────────────
     data = await file.read()
+    size_kb = len(data) / 1024
+    logger.info(f"[upload] read {size_kb:.1f} KB")
     if len(data) > 5 * 1024 * 1024:
+        logger.warning(f"[upload] REJECTED file too large: {size_kb:.1f} KB")
         raise HTTPException(status_code=400, detail="File too large (max 5 MB)")
 
+    # ── build storage path ────────────────────────────────────────────────────
     ext = mimetypes.guess_extension(content_type) or ".jpg"
     ext = ext.replace(".jpe", ".jpg")
     filename = f"{folder}/{uuid.uuid4().hex}{ext}"
-
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            upload_url,
-            content=data,
-            headers={
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  content_type,
-                "x-upsert":      "true",
-            },
-        )
+    logger.info(f"[upload] uploading to {upload_url}")
+
+    # ── push to Supabase Storage ──────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                upload_url,
+                content=data,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  content_type,
+                    "x-upsert":      "true",
+                },
+            )
+    except Exception as exc:
+        logger.error(f"[upload] HTTP ERROR reaching Supabase: {exc}")
+        raise HTTPException(status_code=502, detail=f"Could not reach Supabase Storage: {exc}")
+
+    logger.info(f"[upload] Supabase responded {resp.status_code}: {resp.text[:300]}")
 
     if resp.status_code not in (200, 201):
-        detail = resp.json() if resp.content else {}
+        try:
+            detail = resp.json()
+            msg = detail.get("message") or detail.get("error") or resp.text
+        except Exception:
+            msg = resp.text
+        logger.error(f"[upload] STORAGE FAILED status={resp.status_code} msg={msg!r}")
         raise HTTPException(
             status_code=500,
-            detail=f"Storage upload failed: {detail.get('message', 'unknown error')}"
+            detail=f"Storage upload failed ({resp.status_code}): {msg}"
         )
 
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
+    logger.info(f"[upload] SUCCESS public_url={public_url}")
     return {"url": public_url, "filename": filename, "folder": folder}
 
 
