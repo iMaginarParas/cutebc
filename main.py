@@ -841,7 +841,7 @@ async def submit_order(
         "notes":              notes,
         "status":             "paid",
         "screenshot_url":     screenshot_url,
-    }).select("*").execute()
+    }).execute()
 
     order = result.data[0] if result.data else {}
 
