@@ -156,6 +156,102 @@ async def upload_image(
     return {"url": public_url, "filename": filename, "folder": folder}
 
 
+# ── Public Media Upload (image OR video) ──────────────────────────────────────
+
+PUBLIC_UPLOAD_FOLDER = "public-uploads"  # everything from this endpoint lives here
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024     # 5 MB
+MAX_VIDEO_SIZE = 50 * 1024 * 1024    # 50 MB — Railway request body limits may bite above this
+
+
+@app.post("/upload-media")
+async def upload_media(file: UploadFile = File(...)):
+    """
+    PUBLIC endpoint — no auth required.
+
+    Upload a single image or video file. It is stored in Supabase Storage
+    under the "public-uploads/" folder and a public URL is returned.
+
+    Accepted types:
+      - Images: jpeg, png, webp, gif, avif   (max 5 MB)
+      - Videos: mp4, webm, mov, mkv           (max 50 MB)
+
+    NOTE: Since this endpoint has no auth, anyone with the URL can upload.
+    Consider adding rate limiting / CAPTCHA if abuse becomes a problem.
+    """
+    content_type = file.content_type or "application/octet-stream"
+    logger.info(f"[public-upload] START filename={file.filename!r} content_type={content_type!r}")
+
+    if content_type in ALLOWED_IMAGE_TYPES:
+        media_kind = "image"
+        max_size = MAX_IMAGE_SIZE
+    elif content_type in ALLOWED_VIDEO_TYPES:
+        media_kind = "video"
+        max_size = MAX_VIDEO_SIZE
+    else:
+        logger.warning(f"[public-upload] REJECTED unsupported content_type={content_type!r}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {content_type}. Allowed: images (jpeg/png/webp/gif/avif) or videos (mp4/webm/mov/mkv)."
+        )
+
+    data = await file.read()
+    size_mb = len(data) / (1024 * 1024)
+    logger.info(f"[public-upload] read {size_mb:.2f} MB, kind={media_kind}")
+
+    if len(data) > max_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({size_mb:.1f} MB). Max for {media_kind}: {max_size // (1024*1024)} MB"
+        )
+
+    if len(data) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    ext = mimetypes.guess_extension(content_type) or (".mp4" if media_kind == "video" else ".jpg")
+    ext = ext.replace(".jpe", ".jpg").replace(".qt", ".mov")
+    filename = f"{PUBLIC_UPLOAD_FOLDER}/{media_kind}/{uuid.uuid4().hex}{ext}"
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                upload_url,
+                content=data,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  content_type,
+                    "x-upsert":      "true",
+                },
+            )
+    except Exception as exc:
+        logger.error(f"[public-upload] HTTP ERROR reaching Supabase: {exc}")
+        raise HTTPException(status_code=502, detail=f"Could not reach Supabase Storage: {exc}")
+
+    if resp.status_code not in (200, 201):
+        try:
+            detail = resp.json()
+            msg = detail.get("message") or detail.get("error") or resp.text
+        except Exception:
+            msg = resp.text
+        logger.error(f"[public-upload] STORAGE FAILED status={resp.status_code} msg={msg!r}")
+        raise HTTPException(status_code=500, detail=f"Storage upload failed ({resp.status_code}): {msg}")
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
+    logger.info(f"[public-upload] SUCCESS public_url={public_url}")
+
+    return {
+        "url":       public_url,
+        "filename":  filename,
+        "type":      media_kind,
+        "content_type": content_type,
+        "size_bytes": len(data),
+    }
+
+
 # ── Direct-to-Supabase video upload config ────────────────────────────────────
 
 @app.get("/admin/video-upload-config", dependencies=[Depends(verify_admin)])
