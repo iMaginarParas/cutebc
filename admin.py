@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, timedelta, timezone
+from collections import Counter
 from fastapi import APIRouter, HTTPException, Depends, Header, Query
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
@@ -509,3 +511,107 @@ def admin_delete_skin_lead(lead_id: str, supabase: Client = Depends(get_supabase
     if not result.data:
         raise HTTPException(status_code=404, detail="Skin lead not found")
     return {"deleted": True, "id": lead_id}
+
+
+# ── Analytics ──────────────────────────────────────────────────────────────────
+# Reads from the `events` table populated by the public POST /track endpoint
+# in main.py. Everything is aggregated in Python (fine at this table size);
+# if traffic grows a lot, move this to a Postgres view / RPC instead.
+
+EVENTS_FETCH_LIMIT = 20000  # safety cap per query so a huge range can't hang the request
+
+@router.get("/analytics/summary", dependencies=[Depends(verify_admin)])
+def analytics_summary(
+    days: int = Query(7, ge=1, le=365, description="How many days back to summarise"),
+    supabase: Client = Depends(get_supabase),
+):
+    """
+    Aggregated analytics for the admin dashboard: visitor/session counts,
+    a pageview → product view → add-to-cart → checkout → purchase funnel,
+    top pages, top clicked elements, and a daily pageview series.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        result = (
+            supabase.table("events")
+            .select("event_type,page,label,visitor_id,session_id,meta,created_at")
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(EVENTS_FETCH_LIMIT)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        # Table probably doesn't exist yet — return empty shape instead of a 500
+        # so the dashboard can render a friendly "no data yet" state.
+        return {
+            "range_days": days, "truncated": False,
+            "funnel": {"visitors": 0, "sessions": 0, "pageviews": 0, "product_views": 0,
+                       "add_to_cart": 0, "checkout_start": 0, "purchases": 0},
+            "top_pages": [], "top_clicks": [], "daily_pageviews": [],
+            "error": str(e),
+        }
+
+    def count(etype):
+        return sum(1 for r in rows if r.get("event_type") == etype)
+
+    pageviews = [r for r in rows if r.get("event_type") == "pageview"]
+    visitor_ids = {r["visitor_id"] for r in rows if r.get("visitor_id")}
+    session_ids = {r["session_id"] for r in rows if r.get("session_id")}
+
+    page_counter = Counter(r["page"] for r in pageviews if r.get("page"))
+    click_counter = Counter(r["label"] for r in rows if r.get("event_type") == "click" and r.get("label"))
+
+    purchase_rows = [r for r in rows if r.get("event_type") == "purchase"]
+    revenue_paise = sum((r.get("meta") or {}).get("amount", 0) or 0 for r in purchase_rows)
+
+    daily = Counter()
+    for r in pageviews:
+        created = r.get("created_at") or ""
+        if len(created) >= 10:
+            daily[created[:10]] += 1
+
+    funnel = {
+        "visitors":       len(visitor_ids),
+        "sessions":       len(session_ids),
+        "pageviews":      len(pageviews),
+        "product_views":  count("product_view"),
+        "add_to_cart":    count("add_to_cart"),
+        "checkout_start": count("checkout_start"),
+        "purchases":      len(purchase_rows),
+        "revenue_paise":  revenue_paise,
+    }
+
+    return {
+        "range_days":      days,
+        "truncated":       len(rows) >= EVENTS_FETCH_LIMIT,
+        "funnel":          funnel,
+        "top_pages":       page_counter.most_common(10),
+        "top_clicks":      click_counter.most_common(15),
+        "daily_pageviews": sorted(daily.items()),
+    }
+
+
+@router.get("/analytics/events", dependencies=[Depends(verify_admin)])
+def analytics_raw_events(
+    event_type: Optional[str] = Query(None, description="Filter to a single event_type"),
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(200, le=1000),
+    supabase: Client = Depends(get_supabase),
+):
+    """Raw event log — useful for debugging or drilling into a specific event type."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        query = (
+            supabase.table("events")
+            .select("id,event_type,page,label,visitor_id,session_id,meta,referrer,created_at")
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if event_type:
+            query = query.eq("event_type", event_type)
+        result = query.execute()
+        return {"events": result.data or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

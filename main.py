@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger("upload")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -337,6 +338,15 @@ class AuthLoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class EventIn(BaseModel):
+    """A single analytics event sent from the storefront."""
+    event_type: str                       # pageview | product_view | add_to_cart | checkout_start | checkout_step | purchase | click
+    page: Optional[str] = None            # e.g. "/", "/product.html"
+    label: Optional[str] = None           # button label / product name / step name
+    visitor_id: Optional[str] = None      # long-lived anonymous id (localStorage)
+    session_id: Optional[str] = None      # per-tab-session id (sessionStorage)
+    meta: Optional[dict] = None           # extra structured data (product_id, amount, qty, ...)
+
 
 # ── Auth Helper ───────────────────────────────────────────────────────────────
 
@@ -360,6 +370,48 @@ def get_current_user(authorization: str = Header(...)):
 @app.get("/")
 def health():
     return {"status": "ok", "store": "Prottiva Nutrition", "version": "3.0.0"}
+
+
+# ── Analytics Tracking (public) ───────────────────────────────────────────────
+
+VALID_EVENT_TYPES = {
+    "pageview", "product_view", "add_to_cart", "remove_from_cart",
+    "cart_open", "checkout_start", "checkout_step", "purchase", "click",
+}
+
+@app.post("/track")
+async def track_event(body: EventIn, request: Request):
+    """
+    PUBLIC endpoint — no auth required. Fire-and-forget analytics ingestion.
+
+    The frontend calls this (via navigator.sendBeacon or fetch) for every
+    pageview / click / cart / checkout event. Failures here must NEVER
+    break the storefront, so all errors are swallowed.
+
+    Requires an `events` table in Supabase (see README / migrations).
+    """
+    event_type = (body.event_type or "").strip().lower()
+    if event_type not in VALID_EVENT_TYPES:
+        # Don't hard-fail on unknown event types — just ignore silently so
+        # a typo in the frontend never surfaces as a console error.
+        return {"ok": True, "recorded": False}
+
+    try:
+        supabase.table("events").insert({
+            "event_type":  event_type,
+            "page":        (body.page or "")[:300] or None,
+            "label":       (body.label or "")[:300] or None,
+            "visitor_id":  body.visitor_id,
+            "session_id":  body.session_id,
+            "meta":        body.meta or {},
+            "referrer":    request.headers.get("referer", "")[:500] or None,
+            "user_agent":  request.headers.get("user-agent", "")[:500] or None,
+            "created_at":  datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        return {"ok": True, "recorded": True}
+    except Exception as exc:
+        logger.warning(f"[track] failed to record event={event_type!r}: {exc}")
+        return {"ok": True, "recorded": False}
 
 
 # ── Site Assets (public) ──────────────────────────────────────────────────────
