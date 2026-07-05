@@ -377,6 +377,7 @@ def health():
 VALID_EVENT_TYPES = {
     "pageview", "product_view", "add_to_cart", "remove_from_cart",
     "cart_open", "checkout_start", "checkout_step", "purchase", "click",
+    "scroll_depth",
 }
 
 @app.post("/track")

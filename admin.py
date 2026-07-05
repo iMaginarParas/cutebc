@@ -520,6 +520,47 @@ def admin_delete_skin_lead(lead_id: str, supabase: Client = Depends(get_supabase
 
 EVENTS_FETCH_LIMIT = 20000  # safety cap per query so a huge range can't hang the request
 
+def _classify_device(ua: str):
+    """Cheap keyword-based UA classification — no external dependency needed."""
+    if not ua:
+        return "Unknown", "Unknown"
+    u = ua.lower()
+    if "ipad" in u:
+        return "Tablet", "iOS"
+    if "iphone" in u:
+        return "Mobile", "iOS"
+    if "android" in u:
+        return ("Mobile" if "mobile" in u else "Tablet"), "Android"
+    if "windows" in u:
+        return "Desktop", "Windows"
+    if "macintosh" in u or "mac os" in u:
+        return "Desktop", "macOS"
+    if "linux" in u:
+        return "Desktop", "Linux"
+    return "Unknown", "Unknown"
+
+
+def _traffic_source(meta: dict, referrer_header: str = None):
+    """Best-effort traffic source: UTM source wins, else the referrer's domain, else 'direct'."""
+    meta = meta or {}
+    if meta.get("utm_source"):
+        src = meta["utm_source"]
+        if meta.get("utm_medium"):
+            src = f"{src} / {meta['utm_medium']}"
+        return src
+    ref = meta.get("referrer") or referrer_header or ""
+    if not ref:
+        return "Direct / None"
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(ref).netloc.replace("www.", "")
+        return host or "Direct / None"
+    except Exception:
+        return "Direct / None"
+
+
+CHECKOUT_STEP_ORDER = ["address_submitted", "payment_step_viewed", "screenshot_uploaded", "submit_clicked", "submit_failed"]
+
 @router.get("/analytics/summary", dependencies=[Depends(verify_admin)])
 def analytics_summary(
     days: int = Query(7, ge=1, le=365, description="How many days back to summarise"),
@@ -528,13 +569,23 @@ def analytics_summary(
     """
     Aggregated analytics for the admin dashboard: visitor/session counts,
     a pageview → product view → add-to-cart → checkout → purchase funnel,
-    top pages, top clicked elements, and a daily pageview series.
+    top pages, top clicked elements, traffic sources, device mix, checkout
+    step drop-off, WhatsApp click breakdown, scroll depth, and a daily
+    pageview series.
     """
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    empty_shape = {
+        "range_days": days, "truncated": False,
+        "funnel": {"visitors": 0, "sessions": 0, "pageviews": 0, "product_views": 0,
+                   "add_to_cart": 0, "checkout_start": 0, "purchases": 0},
+        "top_pages": [], "top_clicks": [], "daily_pageviews": [],
+        "traffic_sources": [], "device_breakdown": [], "checkout_funnel": [],
+        "whatsapp_clicks": [], "scroll_depth": [],
+    }
     try:
         result = (
             supabase.table("events")
-            .select("event_type,page,label,visitor_id,session_id,meta,created_at")
+            .select("event_type,page,label,visitor_id,session_id,meta,referrer,user_agent,created_at")
             .gte("created_at", since)
             .order("created_at", desc=True)
             .limit(EVENTS_FETCH_LIMIT)
@@ -544,13 +595,7 @@ def analytics_summary(
     except Exception as e:
         # Table probably doesn't exist yet — return empty shape instead of a 500
         # so the dashboard can render a friendly "no data yet" state.
-        return {
-            "range_days": days, "truncated": False,
-            "funnel": {"visitors": 0, "sessions": 0, "pageviews": 0, "product_views": 0,
-                       "add_to_cart": 0, "checkout_start": 0, "purchases": 0},
-            "top_pages": [], "top_clicks": [], "daily_pageviews": [],
-            "error": str(e),
-        }
+        return {**empty_shape, "error": str(e)}
 
     def count(etype):
         return sum(1 for r in rows if r.get("event_type") == etype)
@@ -561,6 +606,10 @@ def analytics_summary(
 
     page_counter = Counter(r["page"] for r in pageviews if r.get("page"))
     click_counter = Counter(r["label"] for r in rows if r.get("event_type") == "click" and r.get("label"))
+    whatsapp_counter = Counter(
+        r["label"] for r in rows
+        if r.get("event_type") == "click" and (r.get("label") or "").startswith("whatsapp")
+    )
 
     purchase_rows = [r for r in rows if r.get("event_type") == "purchase"]
     revenue_paise = sum((r.get("meta") or {}).get("amount", 0) or 0 for r in purchase_rows)
@@ -570,6 +619,28 @@ def analytics_summary(
         created = r.get("created_at") or ""
         if len(created) >= 10:
             daily[created[:10]] += 1
+
+    # Traffic sources — derived from each pageview's UTM params / referrer
+    source_counter = Counter(_traffic_source(r.get("meta"), r.get("referrer")) for r in pageviews)
+
+    # Device / OS mix — one classification per session, from that session's first-seen user_agent
+    session_ua = {}
+    for r in reversed(rows):  # rows are desc; reverse to get first-seen (earliest) per session
+        sid = r.get("session_id")
+        if sid and sid not in session_ua and r.get("user_agent"):
+            session_ua[sid] = r["user_agent"]
+    device_counter = Counter()
+    for ua in session_ua.values():
+        device, os_name = _classify_device(ua)
+        device_counter[f"{device} ({os_name})"] += 1
+
+    # Checkout step drop-off — ordered so the funnel reads top-to-bottom
+    step_counts = Counter(r["label"] for r in rows if r.get("event_type") == "checkout_step" and r.get("label"))
+    checkout_funnel = [(step, step_counts.get(step, 0)) for step in CHECKOUT_STEP_ORDER]
+
+    # Scroll depth on product pages — % of product-page visits reaching each milestone
+    scroll_counter = Counter(r["label"] for r in rows if r.get("event_type") == "scroll_depth" and r.get("label"))
+    scroll_depth = [(m, scroll_counter.get(m, 0)) for m in ["25%", "50%", "75%", "100%"]]
 
     funnel = {
         "visitors":       len(visitor_ids),
@@ -583,12 +654,17 @@ def analytics_summary(
     }
 
     return {
-        "range_days":      days,
-        "truncated":       len(rows) >= EVENTS_FETCH_LIMIT,
-        "funnel":          funnel,
-        "top_pages":       page_counter.most_common(10),
-        "top_clicks":      click_counter.most_common(15),
-        "daily_pageviews": sorted(daily.items()),
+        "range_days":       days,
+        "truncated":        len(rows) >= EVENTS_FETCH_LIMIT,
+        "funnel":           funnel,
+        "top_pages":        page_counter.most_common(10),
+        "top_clicks":       click_counter.most_common(15),
+        "daily_pageviews":  sorted(daily.items()),
+        "traffic_sources":  source_counter.most_common(10),
+        "device_breakdown": device_counter.most_common(10),
+        "checkout_funnel":  checkout_funnel,
+        "whatsapp_clicks":  whatsapp_counter.most_common(10),
+        "scroll_depth":     scroll_depth,
     }
 
 
