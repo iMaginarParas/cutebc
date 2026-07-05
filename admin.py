@@ -709,7 +709,7 @@ def analytics_visitors(
     try:
         result = (
             supabase.table("events")
-            .select("event_type,page,visitor_id,session_id,meta,created_at")
+            .select("event_type,page,visitor_id,session_id,meta,ip_address,created_at")
             .gte("created_at", since)
             .order("created_at", desc=False)   # ascending so "first seen" / "entry page" is set correctly
             .limit(EVENTS_FETCH_LIMIT)
@@ -729,6 +729,7 @@ def analytics_visitors(
             s = sessions[sid] = {
                 "session_id": sid,
                 "visitor_id": r.get("visitor_id"),
+                "ip_address": r.get("ip_address"),
                 "first_seen": r.get("created_at"),
                 "last_seen": r.get("created_at"),
                 "event_count": 0,
@@ -739,6 +740,8 @@ def analytics_visitors(
             }
         s["event_count"] += 1
         s["last_seen"] = r.get("created_at")  # rows are ascending, so last write is the latest
+        if r.get("ip_address") and not s.get("ip_address"):
+            s["ip_address"] = r["ip_address"]
         if r.get("page"):
             s["pages"].add(r["page"])
         if r.get("event_type") == "purchase":
@@ -750,6 +753,7 @@ def analytics_visitors(
     out = [{
         "session_id":            s["session_id"],
         "visitor_id":            s["visitor_id"],
+        "ip_address":            s["ip_address"],
         "first_seen":            s["first_seen"],
         "last_seen":             s["last_seen"],
         "event_count":           s["event_count"],
@@ -775,7 +779,7 @@ def analytics_visitor_journey(session_id: str, supabase: Client = Depends(get_su
     try:
         result = (
             supabase.table("events")
-            .select("event_type,page,label,visitor_id,meta,referrer,created_at")
+            .select("event_type,page,label,visitor_id,ip_address,meta,referrer,created_at")
             .eq("session_id", session_id)
             .order("created_at", desc=False)
             .limit(1000)
@@ -789,4 +793,5 @@ def analytics_visitor_journey(session_id: str, supabase: Client = Depends(get_su
         raise HTTPException(status_code=404, detail="No events found for this session")
 
     visitor_id = next((r.get("visitor_id") for r in rows if r.get("visitor_id")), None)
-    return {"session_id": session_id, "visitor_id": visitor_id, "events": rows}
+    ip_address = next((r.get("ip_address") for r in rows if r.get("ip_address")), None)
+    return {"session_id": session_id, "visitor_id": visitor_id, "ip_address": ip_address, "events": rows}

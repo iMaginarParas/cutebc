@@ -380,6 +380,17 @@ VALID_EVENT_TYPES = {
     "scroll_depth",
 }
 
+def get_client_ip(request: Request) -> Optional[str]:
+    """
+    Railway (and most hosts) sit behind a proxy, so request.client.host is the
+    proxy's IP, not the visitor's. Real client IP is the first hop in
+    X-Forwarded-For when present.
+    """
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else None
+
 @app.post("/track")
 async def track_event(body: EventIn, request: Request):
     """
@@ -407,6 +418,7 @@ async def track_event(body: EventIn, request: Request):
             "meta":        body.meta or {},
             "referrer":    request.headers.get("referer", "")[:500] or None,
             "user_agent":  request.headers.get("user-agent", "")[:500] or None,
+            "ip_address":  get_client_ip(request),
             "created_at":  datetime.now(timezone.utc).isoformat(),
         }).execute()
         return {"ok": True, "recorded": True}
