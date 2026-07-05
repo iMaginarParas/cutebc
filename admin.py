@@ -615,3 +615,102 @@ def analytics_raw_events(
         return {"events": result.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/analytics/visitors", dependencies=[Depends(verify_admin)])
+def analytics_visitors(
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(50, le=200),
+    supabase: Client = Depends(get_supabase),
+):
+    """
+    One row per SESSION (a single visit — session_id resets each new tab/browser
+    session), built by grouping raw events. Sorted most-recent-first. Flags
+    whether the underlying visitor_id shows up in more than one session in
+    this window, so repeat visitors are visible at a glance.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        result = (
+            supabase.table("events")
+            .select("event_type,page,visitor_id,session_id,meta,created_at")
+            .gte("created_at", since)
+            .order("created_at", desc=False)   # ascending so "first seen" / "entry page" is set correctly
+            .limit(EVENTS_FETCH_LIMIT)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        return {"visitors": [], "total_sessions": 0, "truncated": False, "error": str(e)}
+
+    sessions = {}
+    for r in rows:
+        sid = r.get("session_id")
+        if not sid:
+            continue
+        s = sessions.get(sid)
+        if s is None:
+            s = sessions[sid] = {
+                "session_id": sid,
+                "visitor_id": r.get("visitor_id"),
+                "first_seen": r.get("created_at"),
+                "last_seen": r.get("created_at"),
+                "event_count": 0,
+                "pages": set(),
+                "entry_page": r.get("page"),
+                "converted": False,
+                "purchase_amount_paise": 0,
+            }
+        s["event_count"] += 1
+        s["last_seen"] = r.get("created_at")  # rows are ascending, so last write is the latest
+        if r.get("page"):
+            s["pages"].add(r["page"])
+        if r.get("event_type") == "purchase":
+            s["converted"] = True
+            s["purchase_amount_paise"] += (r.get("meta") or {}).get("amount", 0) or 0
+
+    visitor_session_count = Counter(s["visitor_id"] for s in sessions.values() if s.get("visitor_id"))
+
+    out = [{
+        "session_id":            s["session_id"],
+        "visitor_id":            s["visitor_id"],
+        "first_seen":            s["first_seen"],
+        "last_seen":             s["last_seen"],
+        "event_count":           s["event_count"],
+        "page_count":            len(s["pages"]),
+        "entry_page":            s["entry_page"],
+        "converted":             s["converted"],
+        "purchase_amount_paise": s["purchase_amount_paise"],
+        "is_repeat_visitor":     visitor_session_count.get(s["visitor_id"], 0) > 1,
+    } for s in sessions.values()]
+
+    out.sort(key=lambda x: x["last_seen"] or "", reverse=True)
+
+    return {
+        "visitors": out[:limit],
+        "total_sessions": len(out),
+        "truncated": len(rows) >= EVENTS_FETCH_LIMIT,
+    }
+
+
+@router.get("/analytics/visitor/{session_id}", dependencies=[Depends(verify_admin)])
+def analytics_visitor_journey(session_id: str, supabase: Client = Depends(get_supabase)):
+    """Full, time-ordered event timeline for a single session — the actual click-by-click journey."""
+    try:
+        result = (
+            supabase.table("events")
+            .select("event_type,page,label,visitor_id,meta,referrer,created_at")
+            .eq("session_id", session_id)
+            .order("created_at", desc=False)
+            .limit(1000)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No events found for this session")
+
+    visitor_id = next((r.get("visitor_id") for r in rows if r.get("visitor_id")), None)
+    return {"session_id": session_id, "visitor_id": visitor_id, "events": rows}
