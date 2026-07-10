@@ -439,9 +439,10 @@ def admin_delete_newsletter_subscriber(email: str, supabase: Client = Depends(ge
 def list_purchases(
     supabase: Client = Depends(get_supabase),
     status: Optional[str] = Query(None, description="paid | pending | failed"),
+    payment_method: Optional[str] = Query(None, description="upi | cod"),
     limit: int = Query(100, le=500),
 ):
-    """List all purchases, optionally filtered by payment status."""
+    """List all purchases, optionally filtered by payment status and/or payment method."""
     query = (
         supabase.table("purchases")
         .select("*")
@@ -450,6 +451,8 @@ def list_purchases(
     )
     if status:
         query = query.eq("status", status)
+    if payment_method:
+        query = query.eq("payment_method", payment_method)
     result = query.execute()
     return {"purchases": result.data}
 

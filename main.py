@@ -715,7 +715,7 @@ def get_profile_me(user=Depends(get_current_user)):
     try:
         orders_resp = (
             supabase.table("purchases")
-            .select("id,razorpay_order_id,razorpay_payment_id,customer_name,customer_email,customer_phone,amount,currency,items,status,delivery_address,created_at")
+            .select("id,razorpay_order_id,razorpay_payment_id,customer_name,customer_email,customer_phone,amount,currency,items,status,payment_method,delivery_address,created_at")
             .eq("customer_email", email)
             .order("created_at", desc=True)
             .execute()
@@ -758,7 +758,7 @@ def get_order_history(
 
     query = supabase.table("purchases").select(
         "id,created_at,razorpay_order_id,razorpay_payment_id,"
-        "amount,currency,status,items,delivery_address,customer_name,"
+        "amount,currency,status,payment_method,items,delivery_address,customer_name,"
         "customer_email,customer_phone,notes"
     )
     if email:
@@ -922,7 +922,8 @@ import json as _json
 
 @app.post("/submit-order")
 async def submit_order(
-    screenshot: UploadFile = File(...),
+    payment_method: str = Form("upi"),
+    screenshot: Optional[UploadFile] = File(None),
     name: str = Form(...),
     email: str = Form(...),
     phone: str = Form(...),
@@ -932,11 +933,14 @@ async def submit_order(
     notes: Optional[str] = Form(None),
 ):
     """
-    Single endpoint for the QR-pay flow:
-    1. Validates inputs
-    2. Uploads the payment screenshot to Supabase Storage
-    3. Inserts a purchase row with status='paid'
+    Single endpoint for both checkout flows:
+    - UPI: validates + uploads the payment screenshot to Supabase Storage, marks the order 'paid'
+    - COD (Cash on Delivery): no screenshot required, marks the order 'pending' (collected on delivery)
     """
+    payment_method = (payment_method or "upi").strip().lower()
+    if payment_method not in ("upi", "cod"):
+        raise HTTPException(status_code=400, detail="payment_method must be 'upi' or 'cod'")
+
     # Basic validation
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid order amount")
@@ -945,37 +949,43 @@ async def submit_order(
     if not phone.lstrip("+").isdigit() or len(phone.lstrip("+")) < 10:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    # Validate screenshot
-    allowed_types = {"image/jpeg", "image/png", "image/webp"}
-    content_type = screenshot.content_type or "application/octet-stream"
-    if content_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="Screenshot must be JPG, PNG or WebP")
+    screenshot_url = None
 
-    ss_data = await screenshot.read()
-    if len(ss_data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Screenshot too large (max 5 MB)")
+    if payment_method == "upi":
+        # Screenshot is mandatory for UPI orders
+        if screenshot is None:
+            raise HTTPException(status_code=400, detail="Payment screenshot is required for UPI orders")
 
-    # Upload screenshot to Supabase Storage under screenshots/
-    ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(content_type, ".jpg")
-    ss_filename = f"screenshots/{uuid.uuid4().hex}{ext}"
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{ss_filename}"
+        allowed_types = {"image/jpeg", "image/png", "image/webp"}
+        content_type = screenshot.content_type or "application/octet-stream"
+        if content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Screenshot must be JPG, PNG or WebP")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            upload_url,
-            content=ss_data,
-            headers={
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  content_type,
-                "x-upsert":      "true",
-            },
-        )
+        ss_data = await screenshot.read()
+        if len(ss_data) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Screenshot too large (max 5 MB)")
 
-    if resp.status_code not in (200, 201):
-        detail = resp.json() if resp.content else {}
-        raise HTTPException(status_code=500, detail=f"Screenshot upload failed: {detail.get('message', 'unknown error')}")
+        # Upload screenshot to Supabase Storage under screenshots/
+        ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(content_type, ".jpg")
+        ss_filename = f"screenshots/{uuid.uuid4().hex}{ext}"
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{ss_filename}"
 
-    screenshot_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{ss_filename}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                upload_url,
+                content=ss_data,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  content_type,
+                    "x-upsert":      "true",
+                },
+            )
+
+        if resp.status_code not in (200, 201):
+            detail = resp.json() if resp.content else {}
+            raise HTTPException(status_code=500, detail=f"Screenshot upload failed: {detail.get('message', 'unknown error')}")
+
+        screenshot_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{ss_filename}"
 
     # Parse JSON fields sent as form strings
     try:
@@ -988,8 +998,11 @@ async def submit_order(
     except Exception:
         address = {}
 
-    # Insert purchase row — status is 'paid' immediately on screenshot upload
-    order_id = f"UPI-{uuid.uuid4().hex[:12].upper()}"
+    # Insert purchase row
+    # UPI orders are marked 'paid' immediately (screenshot verified manually after the fact).
+    # COD orders are marked 'pending' since cash is only collected on delivery.
+    order_prefix = "UPI" if payment_method == "upi" else "COD"
+    order_id = f"{order_prefix}-{uuid.uuid4().hex[:12].upper()}"
     result = supabase.table("purchases").insert({
         "razorpay_order_id":  order_id,      # repurposed as our internal order ref
         "customer_name":      name,
@@ -1000,7 +1013,8 @@ async def submit_order(
         "currency":           "INR",
         "items":              items_list,
         "notes":              notes,
-        "status":             "paid",
+        "payment_method":     payment_method,
+        "status":             "paid" if payment_method == "upi" else "pending",
         "screenshot_url":     screenshot_url,
     }).execute()
 
@@ -1027,7 +1041,12 @@ async def submit_order(
             except Exception:
                 pass
 
-    return {"success": True, "order_id": order_id, "screenshot_url": screenshot_url}
+    return {
+        "success": True,
+        "order_id": order_id,
+        "payment_method": payment_method,
+        "screenshot_url": screenshot_url,
+    }
 
 
 # ── Admin: List all purchases ─────────────────────────────────────────────────
@@ -1037,7 +1056,7 @@ def admin_list_purchases():
     """Return all purchase records for the admin dashboard."""
     result = (
         supabase.table("purchases")
-        .select("id,razorpay_order_id,customer_name,customer_email,customer_phone,amount,currency,status,items,delivery_address,screenshot_url,created_at")
+        .select("id,razorpay_order_id,customer_name,customer_email,customer_phone,amount,currency,status,payment_method,items,delivery_address,screenshot_url,created_at")
         .order("created_at", desc=True)
         .execute()
     )
