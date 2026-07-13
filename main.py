@@ -7,10 +7,12 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 import httpx
 import uuid
 import mimetypes
+import hashlib
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -24,6 +26,14 @@ ADMIN_SECRET        = os.environ.get("ADMIN_SECRET", "change-me")
 REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 STORAGE_BUCKET      = "product"
 REPLICATE_API       = "https://api.replicate.com/v1"
+
+# PayU payment gateway
+PAYU_MERCHANT_KEY  = os.environ.get("PAYU_MERCHANT_KEY", "")
+PAYU_MERCHANT_SALT = os.environ.get("PAYU_MERCHANT_SALT", "")
+PAYU_BASE_URL      = os.environ.get("PAYU_BASE_URL", "https://test.payu.in")   # https://secure.payu.in once live-tested
+PAYU_SURL          = os.environ.get("PAYU_SURL", "")   # e.g. https://cutestorebc-production.up.railway.app/payu/success
+PAYU_FURL          = os.environ.get("PAYU_FURL", "")   # e.g. https://cutestorebc-production.up.railway.app/payu/failure
+FRONTEND_URL       = os.environ.get("FRONTEND_URL", "")  # where to bounce the customer after we process PayU's redirect
 
 # Replicate model for skin transformation
 SKIN_MODEL_VERSION  = "bytedance/seedream-4.5"
@@ -44,6 +54,27 @@ VALID_FOLDERS = {"products", "categories", "banners", "logo", "blog"}
 def verify_admin(x_admin_token: str = Header(...)):
     if x_admin_token != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
+# ── PayU Helpers ────────────────────────────────────────────────────────────
+
+def payu_amount(paise: int) -> str:
+    """PayU wants amount in rupees with 2 decimals, not paise."""
+    return f"{paise / 100:.2f}"
+
+
+def payu_generate_hash(txnid: str, amount: str, productinfo: str, firstname: str, email: str) -> str:
+    """Request hash: key|txnid|amount|productinfo|firstname|email|udf1..udf10|salt"""
+    parts = [PAYU_MERCHANT_KEY, txnid, amount, productinfo, firstname, email] + [""] * 10 + [PAYU_MERCHANT_SALT]
+    return hashlib.sha512("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def payu_verify_response_hash(status: str, txnid: str, amount: str, productinfo: str,
+                               firstname: str, email: str, received_hash: str) -> bool:
+    """Reverse hash: salt|status|udf10..udf1|email|firstname|productinfo|amount|txnid|key"""
+    parts = [PAYU_MERCHANT_SALT, status] + [""] * 10 + [email, firstname, productinfo, amount, txnid, PAYU_MERCHANT_KEY]
+    computed = hashlib.sha512("|".join(parts).encode("utf-8")).hexdigest()
+    return computed.lower() == (received_hash or "").lower()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -287,6 +318,15 @@ class DeliveryAddress(BaseModel):
     pincode: str
     country: str = "India"
 
+
+class PayUOrderRequest(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+    amount: int                       # paise, same convention as everywhere else
+    items: List[CartItem] = []
+    delivery_address: DeliveryAddress
+    notes: Optional[str] = None
 
 
 class NewsletterRequest(BaseModel):
@@ -1047,6 +1087,143 @@ async def submit_order(
         "payment_method": payment_method,
         "screenshot_url": screenshot_url,
     }
+
+
+# ── Checkout: PayU (cards / UPI / netbanking via Hosted Checkout) ────────────
+
+@app.post("/create-payu-order")
+def create_payu_order(body: PayUOrderRequest):
+    """
+    Starts a PayU Hosted Checkout transaction.
+
+    Returns the fields the frontend must POST (as a hidden auto-submitting
+    <form>) to PayU's `action` URL. PayU handles the card/UPI/netbanking flow
+    itself, then redirects the customer's browser to /payu/success or
+    /payu/failure with a signed response.
+    """
+    if not PAYU_MERCHANT_KEY or not PAYU_MERCHANT_SALT:
+        raise HTTPException(status_code=503, detail="PayU is not configured (missing PAYU_MERCHANT_KEY/SALT)")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid order amount")
+
+    phone = body.phone.strip()
+    if not phone.lstrip("+").isdigit() or len(phone.lstrip("+")) < 10:
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+
+    txnid = f"PAYU-{uuid.uuid4().hex[:12].upper()}"
+    amount_str = payu_amount(body.amount)
+    productinfo = "Order"
+
+    supabase.table("purchases").insert({
+        "razorpay_order_id":  txnid,     # repurposed as our internal order ref, same as UPI/COD
+        "customer_name":      body.name,
+        "customer_email":     body.email,
+        "customer_phone":     phone,
+        "delivery_address":   body.delivery_address.model_dump(),
+        "amount":             body.amount,
+        "currency":           "INR",
+        "items":              [item.model_dump() for item in body.items],
+        "notes":              body.notes,
+        "payment_method":     "payu",
+        "status":             "pending",
+    }).execute()
+
+    return {
+        "action":      f"{PAYU_BASE_URL}/_payment",
+        "key":         PAYU_MERCHANT_KEY,
+        "txnid":       txnid,
+        "amount":      amount_str,
+        "productinfo": productinfo,
+        "firstname":   body.name,
+        "email":       body.email,
+        "phone":       phone,
+        "surl":        PAYU_SURL,
+        "furl":        PAYU_FURL,
+        "hash":        payu_generate_hash(txnid, amount_str, productinfo, body.name, body.email),
+    }
+
+
+async def _handle_payu_callback(request: Request) -> dict:
+    """Shared logic for /payu/success and /payu/failure — PayU posts the same shape to both."""
+    form = await request.form()
+    status_       = form.get("status", "")
+    txnid         = form.get("txnid", "")
+    amount        = form.get("amount", "")
+    productinfo   = form.get("productinfo", "")
+    firstname     = form.get("firstname", "")
+    email         = form.get("email", "")
+    received_hash = form.get("hash", "")
+
+    if not payu_verify_response_hash(status_, txnid, amount, productinfo, firstname, email, received_hash):
+        logger.error(f"[payu] HASH MISMATCH txnid={txnid!r} status={status_!r}")
+        raise HTTPException(status_code=400, detail="Hash mismatch — response may have been tampered with")
+
+    existing = supabase.table("purchases").select("*").eq("razorpay_order_id", txnid).execute()
+    if not existing.data:
+        logger.error(f"[payu] Unknown txnid={txnid!r}")
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    purchase = existing.data[0]
+
+    # Defense in depth: the hash already covers amount, but double-check against
+    # what we stored when the order was created.
+    if amount != payu_amount(purchase["amount"]):
+        logger.error(f"[payu] AMOUNT MISMATCH txnid={txnid!r} got={amount!r} expected={payu_amount(purchase['amount'])!r}")
+        raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    # Idempotency — PayU (or the customer's browser) may hit this more than once.
+    if purchase["status"] != "pending":
+        return purchase
+
+    new_status = "paid" if status_ == "success" else "failed"
+    update_payload = {"status": new_status, "razorpay_payment_id": form.get("mihpayid")}
+    try:
+        supabase.table("purchases").update({**update_payload, "payment_mode": form.get("mode")}) \
+            .eq("razorpay_order_id", txnid).execute()
+    except Exception:
+        # "payment_mode" column may not exist yet — retry without it rather than fail the callback.
+        supabase.table("purchases").update(update_payload).eq("razorpay_order_id", txnid).execute()
+
+    if new_status == "paid":
+        for item in (purchase.get("items") or []):
+            if item.get("is_subscription"):
+                try:
+                    supabase.table("subscriptions").insert({
+                        "product_id":       item.get("id"),
+                        "product_name":     item.get("name"),
+                        "base_price":       item.get("price"),
+                        "discounted_price": item.get("price"),
+                        "discount_pct":     15.0,
+                        "customer_name":    purchase.get("customer_name"),
+                        "customer_email":   purchase.get("customer_email"),
+                        "customer_phone":   purchase.get("customer_phone"),
+                        "delivery_address": purchase.get("delivery_address"),
+                        "frequency_days":   int(item.get("sub_frequency") or 60),
+                        "status":           "active",
+                        "purchase_id":      purchase.get("id"),
+                    }).execute()
+                except Exception:
+                    pass
+
+    return {**purchase, "status": new_status}
+
+
+@app.post("/payu/success")
+async def payu_success(request: Request):
+    """PayU POSTs here after a successful payment (this is your `surl`)."""
+    result = await _handle_payu_callback(request)
+    if FRONTEND_URL:
+        return RedirectResponse(f"{FRONTEND_URL}/order-confirmed?order_id={result['razorpay_order_id']}", status_code=303)
+    return result
+
+
+@app.post("/payu/failure")
+async def payu_failure(request: Request):
+    """PayU POSTs here after a failed/cancelled payment (this is your `furl`)."""
+    result = await _handle_payu_callback(request)
+    if FRONTEND_URL:
+        return RedirectResponse(f"{FRONTEND_URL}/order-failed?order_id={result['razorpay_order_id']}", status_code=303)
+    return result
 
 
 # ── Admin: List all purchases ─────────────────────────────────────────────────
