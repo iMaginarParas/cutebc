@@ -1213,7 +1213,7 @@ async def payu_success(request: Request):
     """PayU POSTs here after a successful payment (this is your `surl`)."""
     result = await _handle_payu_callback(request)
     if FRONTEND_URL:
-        return RedirectResponse(f"{FRONTEND_URL}/order-confirmed?order_id={result['razorpay_order_id']}", status_code=303)
+        return RedirectResponse(f"{FRONTEND_URL}/checkout.html?payu=success&order_id={result['razorpay_order_id']}", status_code=303)
     return result
 
 
@@ -1222,7 +1222,7 @@ async def payu_failure(request: Request):
     """PayU POSTs here after a failed/cancelled payment (this is your `furl`)."""
     result = await _handle_payu_callback(request)
     if FRONTEND_URL:
-        return RedirectResponse(f"{FRONTEND_URL}/order-failed?order_id={result['razorpay_order_id']}", status_code=303)
+        return RedirectResponse(f"{FRONTEND_URL}/checkout.html?payu=failed&order_id={result['razorpay_order_id']}", status_code=303)
     return result
 
 
